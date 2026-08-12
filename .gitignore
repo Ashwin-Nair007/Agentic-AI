@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets
+.env
+
+# Persisted chat session state
+.chat_sessions/
+
+# Test artifacts
+.pytest_cache/
