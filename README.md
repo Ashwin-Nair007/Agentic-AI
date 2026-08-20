@@ -9,6 +9,9 @@ closing and reopening the CLI.
 - **Phase 2** (`agent_phase2.py`) — everything Phase 1 has, plus a
   `web_search` tool the agent can reach for when it needs to answer
   something factual it doesn't already know.
+- **Phase 3** (`agent_phase3.py`) — everything Phase 2 has, plus a
+  `read_file` tool so the agent can look at the actual contents of a local
+  file instead of guessing.
 
 ## The 5-year-old explanation
 
@@ -204,6 +207,89 @@ the model aren't streamed the way Phase 1's are. Only the *final* answer
   and real Tavily search; needs both `OPENROUTER_API_KEY` and
   `TAVILY_API_KEY`.
 
+## Phase 3: letting the robot open your filing cabinet
+
+Phase 2's robot can look things up on the web, but it still can't see
+anything sitting on *your* computer. If you say "what does `notes.txt`
+say?", it has no way to check — it can only guess.
+
+Phase 3 adds a second tool: `read_file`. Same idea as the phone book, but
+instead of calling out to the web, the robot opens an actual file on your
+hard drive and reads it before answering:
+
+1. You mention a specific file.
+2. The robot thinks "I should actually look at that instead of guessing,"
+   and calls `read_file` with the path.
+3. It gets back the file's real contents (or, if the file doesn't exist or
+   can't be read as text, a note saying so) and answers based on what it
+   actually found.
+4. It now has *two* tools to choose from — the phone book (`web_search`)
+   for things out in the world, the filing cabinet (`read_file`) for
+   things sitting on your disk — and picks whichever one fits, or neither
+   if it already knows the answer.
+
+> **⚠️ Security note:** `read_file` is **not sandboxed** — this was a
+> deliberate choice, not an oversight. It can read any file the OS user
+> running the script can read, anywhere on disk (no restriction to this
+> project's folder, no path-traversal blocking). Whatever it reads gets
+> sent to the configured OpenRouter model as part of the conversation. If
+> you wouldn't want a file's contents sent to a third-party API, don't ask
+> the agent to read it — and be mindful if you ever combine this with
+> content from an untrusted web search result that might try to talk the
+> model into reading something it shouldn't.
+
+```mermaid
+flowchart TD
+    You(["🧑 You: \"What's in secret.txt?\""]) --> RC
+    subgraph Agent3["agent_phase3.py"]
+        direction TB
+        RC["run_chat()"]
+        RAT["run_agentic_turn()\nnow offers 2 tools"]
+        RTC["run_tool_call()\npicks the right handler by name"]
+    end
+    Model[("☎️ OpenRouter model\nweb_search, read_file, or just answer?")]
+    PhoneBook[("📖 Tavily web search API")]
+    Cabinet[("🗄️ your hard drive")]
+
+    RC --> RAT
+    RAT -->|"ask the model, both tools available"| Model
+    Model -->|"'read_file(\"secret.txt\")'"| RAT
+    RAT --> RTC
+    RTC -->|"query"| PhoneBook
+    RTC -->|"path"| Cabinet
+    Cabinet -->|"file contents, or 'does not exist'"| RTC
+    RTC -->|"tool result appended to transcript"| RAT
+    RAT -->|"ask the model again, now with the file's contents"| Model
+    Model -->|"final answer, no more tool_calls"| RAT
+    RAT -->|"prints & returns the answer"| RC
+```
+
+**Functions added in `agent_phase3.py`** (imports Phase 1's client/session
+helpers and Phase 2's `WEB_SEARCH_TOOL`/`tavily_search`/
+`format_search_results` — only the tool-dispatch loop is rewritten, since
+it now has two tools to choose between instead of one):
+
+| Function | Grown-up job | Kid version |
+|---|---|---|
+| `READ_FILE_TOOL` | The schema describing the `read_file` tool: its name, when to use it, what argument (a path) it takes. | The label on the filing cabinet that says "look things up here too." |
+| `read_file()` | Resolves the path, reads it as UTF-8 text, truncates anything over ~4000 characters, and raises a clear error for a missing file, a directory, or a non-text (binary) file. Never opens a file in write mode. | Opens the real drawer and reads out what's actually inside — or says "that drawer's empty/locked/not paper" instead of making something up. |
+| `run_tool_call()` | Same job as Phase 2's, but now checks the tool's *name* first and routes to `web_search` or `read_file` accordingly (or reports an unknown tool). | Figures out whether the robot wants the phone book or the filing cabinet, and hands over the right one. |
+| `run_agentic_turn()` / `run_chat()` | Identical shape to Phase 2's, just with both tools available and both `search_fn`/`read_file_fn` threaded through so tests can fake either one. | Same conductor, same "hang on, let me check" loop — just a bigger toolbox. |
+
+### How the Phase 3 tests fit in
+
+- `tests/test_file_reading.py` — `read_file()` is tested against **real
+  temporary files** created just for the test (no fake needed — reading
+  your own disk isn't an unreliable external service the way Tavily is),
+  covering normal reads, truncation, a missing file, a directory, and a
+  binary file. A scriptable fake "model" then covers the PASS/FAIL tool
+  loop, choosing between `web_search` and `read_file`, an unknown tool
+  name, the max-retry cutoff, and persistence/rollback through `run_chat`.
+- `tests/test_live_file_reading.py` — the same PASS/FAIL pair against the
+  real model: it correctly reads a real planted value out of a temp file,
+  and correctly reports (rather than invents) that a file doesn't exist.
+  Needs only `OPENROUTER_API_KEY` (these cases don't need Tavily).
+
 ## Setup
 
 1. Install [uv](https://docs.astral.sh/uv/) if you don't already have it.
@@ -213,9 +299,10 @@ the model aren't streamed the way Phase 1's are. Only the *final* answer
    OPENROUTER_API_KEY=your-key-here
    TAVILY_API_KEY=your-key-here
    ```
-   `OPENROUTER_API_KEY` is required for both phases. `TAVILY_API_KEY` (free
-   tier at [tavily.com](https://tavily.com)) is only needed for Phase 2's
-   `web_search` tool — Phase 1 runs fine without it.
+   `OPENROUTER_API_KEY` is required for all phases. `TAVILY_API_KEY` (free
+   tier at [tavily.com](https://tavily.com)) is only needed for the
+   `web_search` tool in Phases 2 and 3 — Phase 1, and Phase 3's `read_file`
+   tool, run fine without it.
 
 > **Note:** this project's OpenRouter account currently has no purchased
 > credits, so paid models will fail with a 402 error. Stick to `:free`
@@ -226,17 +313,19 @@ the model aren't streamed the way Phase 1's are. Only the *final* answer
 ```
 uv run python agent_phase1.py [--model MODEL] [--system "system prompt"] [--session NAME]
 uv run python agent_phase2.py [--model MODEL] [--system "system prompt"] [--session NAME]
+uv run python agent_phase3.py [--model MODEL] [--system "system prompt"] [--session NAME]
 ```
 
-- `--model` defaults to `nvidia/nemotron-3.5-lightning:free` for both phases
-  (confirmed to support tool calling for Phase 2, at no cost).
-- `--system` sets the system prompt (Phase 2's default nudges the model to
-  use `web_search` for current/uncertain facts and skip it otherwise).
+- `--model` defaults to `nvidia/nemotron-3.5-lightning:free` for all
+  phases (confirmed to support tool calling, including choosing correctly
+  between two simultaneously-declared tools, at no cost).
+- `--system` sets the system prompt (Phases 2/3's defaults nudge the model
+  to use `web_search`/`read_file` only when actually needed).
 - `--session` defaults to `default`. Each session name gets its own history
   file at `.chat_sessions/<name>.json` (gitignored — this is the agent's own
-  memory, not tracked in version control). Phase 1 and Phase 2 share the
-  same `.chat_sessions/` directory, so running both against `--session
-  default` continues the same conversation either way.
+  memory, not tracked in version control). All three phases share the same
+  `.chat_sessions/` directory, so running any of them against `--session
+  default` continues the same conversation.
 - Type `/reset` to clear the current session's history, `/exit` or Ctrl+C to quit.
 
 ## Testing
@@ -256,8 +345,15 @@ Phase 2 tests add their own PASS/FAIL pair for the search tool — the agent
 must search when it doesn't know something, but must *not* waste a search
 call on something it already knows (like `2 + 2`) — plus coverage for a
 broken search backend, an unknown tool name, and runaway tool-call loops.
-Each pair is tested both offline (mocked model/search) and live against
-the real APIs.
+
+Phase 3 tests add a PASS/FAIL pair for `read_file` — the agent must read a
+real file's contents when asked about it, but must *not* fabricate
+contents for a file that doesn't exist — plus `read_file()` itself tested
+directly against real temp files (truncation, missing file, directory,
+binary file), and tool selection between `web_search` and `read_file`.
+
+Every pair is tested both offline (mocked model, real disk where relevant)
+and live against the real APIs.
 
 ## Project layout
 
@@ -265,6 +361,9 @@ the real APIs.
   streaming replies, the REPL.
 - `agent_phase2.py` — imports Phase 1's client/session helpers and adds the
   `web_search` tool-calling loop on top.
+- `agent_phase3.py` — imports Phase 1's client/session helpers and Phase
+  2's search-tool pieces, and adds the `read_file` tool alongside
+  `web_search`.
 - `tests/test_state_management.py` — mocked unit tests for Phase 1's
   session persistence and stateful behavior.
 - `tests/test_live_behavior.py` — live integration tests for Phase 1
@@ -274,11 +373,15 @@ the real APIs.
 - `tests/test_live_tool_calling.py` — live integration tests for Phase 2
   against the real model and real Tavily search (opt-in, requires both API
   keys).
+- `tests/test_file_reading.py` — mocked unit tests for Phase 3's
+  `read_file` tool and the combined tool loop.
+- `tests/test_live_file_reading.py` — live integration tests for Phase 3
+  against the real model (opt-in, requires `OPENROUTER_API_KEY`).
 - `tests/conftest.py` — loads `.env` before test collection, so the live
   tests correctly detect the API key(s) and run instead of skipping.
 - `.chat_sessions/` — persisted conversation history per session (gitignored).
 - `src/agentic_ai_project/` — unused scaffold left over from `uv init`, not
-  part of either phase.
+  part of any phase.
 
 See [CLAUDE.md](CLAUDE.md) for architecture notes and a running log of the
 decisions and fixes made so far.

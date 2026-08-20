@@ -15,21 +15,32 @@ An agentic AI project built up in phases:
   needs current or factual information it doesn't already know. Imports
   and reuses Phase 1's client/session helpers rather than duplicating them;
   Phase 1 itself is untouched.
+- `agent_phase3.py` — Phase 2's chat loop plus a `read_file` tool so the
+  model can look at the actual contents of a local file when the user
+  refers to one. Imports Phase 1's client/session helpers and Phase 2's
+  `WEB_SEARCH_TOOL`/`tavily_search`/`format_search_results` rather than
+  duplicating them; Phase 1 and Phase 2 are both untouched.
+  **`read_file` is intentionally unsandboxed** — no restriction to a
+  project directory, can read anything the OS user can read (an explicit
+  choice — see decision #10 below).
 
 ## Environment & setup
 
 - Python >=3.12, dependency/venv management via `uv` (`uv.lock` is committed).
 - Install deps: `uv sync`
 - Secrets live in `.env` (gitignored, never commit it): requires
-  `OPENROUTER_API_KEY` (both phases) and `TAVILY_API_KEY` (Phase 2's search
-  tool only — [tavily.com](https://tavily.com), free tier).
+  `OPENROUTER_API_KEY` (all phases) and `TAVILY_API_KEY` (Phase 2 and
+  Phase 3's search tool only — [tavily.com](https://tavily.com), free tier).
 - Run Phase 1: `uv run python agent_phase1.py [--model MODEL] [--system PROMPT] [--session NAME]`
 - Run Phase 2: `uv run python agent_phase2.py [--model MODEL] [--system PROMPT] [--session NAME]`
+- Run Phase 3: `uv run python agent_phase3.py [--model MODEL] [--system PROMPT] [--session NAME]`
 - **This OpenRouter account currently has no purchased credits** — every
   paid model 402s ("Insufficient credits"). Only `:free`-suffixed models
   work until credits are added. Verified empirically (see decision #7
   below) that the Phase 1 default, `nvidia/nemotron-3.5-lightning:free`,
-  does support tool calling, so Phase 2 keeps the same default model.
+  does support tool calling — including picking correctly between two
+  simultaneously-declared tools (decision #10) — so Phases 2 and 3 keep
+  the same default model.
 
 ## Architecture (`agent_phase1.py`)
 
@@ -82,6 +93,30 @@ per turn).
   function and never hit the network, mirroring how Phase 1's tests inject
   a `FakeClient` instead of a real one.
 
+## Architecture (`agent_phase3.py`)
+
+Imports `make_client`/`load_session`/`save_session`/`clear_session`/
+`build_request_messages` from `agent_phase1`, and `WEB_SEARCH_TOOL`/
+`tavily_search`/`format_search_results` from `agent_phase2`. `run_tool_call`,
+`run_agentic_turn`, and `run_chat` are reimplemented (not imported) because
+they now dispatch across two tools instead of one.
+
+- `READ_FILE_TOOL` — the function-calling schema for `read_file`, alongside
+  `AGENT_TOOLS = [WEB_SEARCH_TOOL, READ_FILE_TOOL]` passed to every model call.
+- `read_file(path)` — resolves `~` and relative paths, rejects directories
+  and files that don't exist, rejects files that fail UTF-8 decoding
+  (binary-file heuristic), and truncates anything over
+  `READ_FILE_MAX_CHARS` (4000) with a `[... truncated ...]` note. Never
+  opens a file in write mode — genuinely read-only. Raises on failure;
+  never sandboxed to a directory (see the security note above).
+- `run_tool_call` — same shape as Phase 2's, but dispatches on
+  `call.function.name` between `web_search` and `read_file` (an if/elif,
+  not a registry — only two tools exist, so a lookup table would be an
+  abstraction the task doesn't need yet).
+- `run_agentic_turn` / `run_chat` — identical structure to Phase 2's,
+  threading both `search_fn` and `read_file_fn` through as injectable
+  parameters for testing, same rollback-whole-turn-on-failure behavior.
+
 ## Testing
 
 - `uv run pytest` — mocked suite, fast/deterministic, no network or token
@@ -105,6 +140,18 @@ per turn).
   what it doesn't know, skips search for `2 + 2`) against the real model
   and real Tavily API; needs both `OPENROUTER_API_KEY` and
   `TAVILY_API_KEY`.
+- `tests/test_file_reading.py` — `read_file()` tested directly against real
+  temporary files (truncation, missing file, directory, binary file — no
+  fake needed, there's no external service to mock for local disk I/O),
+  plus a scriptable `FakeClient` for the PASS/FAIL tool-loop pair (reads a
+  real temp file and answers from it; reports a missing file as a tool
+  failure instead of fabricating content), tool selection between
+  `web_search` and `read_file`, unknown-tool and max-iteration handling,
+  and persistence/rollback through `run_chat`.
+- `tests/test_live_file_reading.py` — the same PASS/FAIL pair against the
+  real model (reads a real temp file with a planted value and reports it
+  correctly; doesn't fabricate contents for a file that doesn't exist);
+  needs only `OPENROUTER_API_KEY` (no Tavily call expected).
 
 ## Notable decisions & history
 
@@ -153,18 +200,50 @@ per turn).
    assembled from streamed text deltas without extra complexity. Only the
    final, no-more-tools-needed answer is printed (as a single block, not
    token-by-token like Phase 1).
+10. **Phase 3 `read_file` is unsandboxed by explicit choice**: it can read
+    any file the OS user running the script can read, anywhere on disk —
+    no restriction to a project/root directory, no path-traversal
+    blocking. This was a deliberate decision (the alternative — restrict
+    to a configurable root directory — was offered and declined) rather
+    than an oversight. Consequence: whatever `read_file` reads is sent to
+    the configured OpenRouter model as part of the conversation, so this
+    should not be pointed at a session/environment with access to files
+    you don't want leaving the machine (SSH keys, credentials, browser
+    profiles, etc.).
+11. **Phase 3 tool dispatch stays a plain if/elif**, not a registry/lookup
+    table keyed by tool name — with exactly two tools, a dict-of-handlers
+    abstraction would be premature; revisit if a third tool is added.
+12. **Phase 3 model choice**: before building, empirically confirmed
+    `nvidia/nemotron-3.5-lightning:free` correctly picks between two
+    *simultaneously declared* tools (`web_search` vs `read_file`) rather
+    than just one — asked a file-content question, a current-events
+    question, and an arithmetic question, and it called the right tool
+    (or no tool) in each case. No default-model change needed.
+13. **Fix — model hallucinated "I can't access your files" after declining
+    offensive content**: `read_file` was never broken — a real session
+    transcript showed it successfully reading a file's contents, but the
+    model then refused to repeat them back (they contained profanity) and,
+    on follow-up asks, started falsely claiming it has no local filesystem
+    access at all ("I can only read files in my own sandbox"), directly
+    contradicting the tool call it had just made. That's the model's
+    content-policy refusal compounding into a hallucinated capability
+    limit — not something `read_file` itself can fix. Addressed by adding
+    an explicit line to `DEFAULT_SYSTEM_PROMPT`: `read_file` genuinely
+    reads the user's local files; if the model declines to relay content,
+    it must say so as a content decision, never claim it lacks the
+    capability.
 
 ## Conventions
 
 - No comments in code unless explaining a non-obvious "why".
 - Tests were written test-first for behavioral changes: the PASS/FAIL
-  "what is my name?" cases, the PASS/FAIL search-tool cases, and the
-  regression tests for the crash, Ctrl+C, and dotenv-in-tests fixes above,
-  were each written to fail against the old/missing behavior before the
-  fix or feature landed.
+  "what is my name?" cases, the PASS/FAIL search-tool cases, the PASS/FAIL
+  read-file cases, and the regression tests for the crash, Ctrl+C, and
+  dotenv-in-tests fixes above, were each written to fail against the
+  old/missing behavior before the fix or feature landed.
 
-## Not part of either phase
+## Not part of any phase
 
 - `src/agentic_ai_project/` is the default `uv init` scaffold and is
-  unrelated to `agent_phase1.py`/`agent_phase2.py`.
+  unrelated to `agent_phase1.py`/`agent_phase2.py`/`agent_phase3.py`.
 - `practice/` is an empty scratch directory.
